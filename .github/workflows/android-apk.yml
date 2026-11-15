@@ -22,32 +22,31 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v5
 
-      - name: Install Android SDK & NDK
-        uses: android-actions/setup-android@v4
-
-      - name: Install required packages
-        run: |
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "ndk;25.2.9519653" "cmake;3.22.1"
-
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.7"
+      - name: Set up Android SDK and NDK
+        uses: android-actions/setup-android@v4
 
-      - name: Build OpenSSL for Android
+      - name: Install SDK packages
         shell: bash
         run: |
           set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "cmake;3.22.1" "ndk;25.2.9519653"
+
+      - name: Build OpenSSL for Android (arm64 + arm)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/25.2.9519653"
+          export PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+
           OPENSSL_VERSION=3.0.16
-          NDK="$ANDROID_HOME/ndk/25.2.9519653"
-          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           WORK="$RUNNER_TEMP/openssl-build"
           BASE="$GITHUB_WORKSPACE/openssl-android"
           mkdir -p "$WORK" "$BASE"
@@ -56,33 +55,58 @@ jobs:
           curl --fail --location --retry 3 \
             "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
             -o "openssl-${OPENSSL_VERSION}.tar.gz"
-          tar xzf "openssl-${OPENSSL_VERSION}.tar.gz"
 
+          tar xzf "openssl-${OPENSSL_VERSION}.tar.gz"
           cd "openssl-${OPENSSL_VERSION}"
 
-          for spec in \
-            "arm64:android-arm64:aarch64-linux-android21-clang" \
-            "arm:android-arm:armv7a-linux-androideabi19-clang"; do
-            IFS=: read -r dir target compiler <<< "$spec"
-            prefix="$BASE/openssl-${dir}"
+          # Note:
+          # - OpenSSL must be built with the Android NDK clang toolchain
+          # - Do NOT rely on old gcc names like aarch64-linux-android-gcc
+          # - Set ANDROID_NDK_ROOT and use the full clang paths
 
-            make clean >/dev/null 2>&1 || true
-            PATH="$TOOLCHAIN:$PATH" ./Configure "$target" \
-              "CC=$TOOLCHAIN/$compiler" \
-              AR="$TOOLCHAIN/llvm-ar" \
-              RANLIB="$TOOLCHAIN/llvm-ranlib" \
+          build_one() {
+            local target="$1"
+            local api="$2"
+            local arch="$3"
+            local cc="$4"
+            local prefix="$BASE/openssl-${arch}"
+
+            make distclean >/dev/null 2>&1 || true
+
+            ./Configure "$target" \
+              CC="$cc" \
+              AR="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
+              RANLIB="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
               no-shared no-tests no-asm \
+              -D__ANDROID_API__="$api" \
               --prefix="$prefix" --libdir=lib
 
             make -j"$(nproc)"
             make install_sw
-          done
+          }
+
+          # arm64
+          build_one \
+            "android-arm64" \
+            "21" \
+            "arm64" \
+            "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+
+          # arm
+          build_one \
+            "android-arm" \
+            "19" \
+            "arm" \
+            "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi19-clang"
 
       - name: Build APK
         working-directory: android
         env:
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_HOME }}/ndk/25.2.9519653
           OPENSSL_BASE_DIR: ${{ github.workspace }}/openssl-android
-        run: gradle --no-daemon :app:assembleDebug
+        run: |
+          set -euo pipefail
+          gradle --no-daemon :app:assembleDebug
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
