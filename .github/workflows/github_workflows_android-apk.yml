@@ -1,0 +1,93 @@
+name: Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "android/**"
+      - "core/**"
+      - "platform/**"
+      - ".github/workflows/android-apk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    name: Build debug APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Android SDK & NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install required packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "ndk;25.2.9519653" "cmake;3.22.1"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build OpenSSL for Android
+        shell: bash
+        run: |
+          set -euo pipefail
+          OPENSSL_VERSION=3.0.16
+          NDK="$ANDROID_HOME/ndk/25.2.9519653"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          WORK="$RUNNER_TEMP/openssl-build"
+          BASE="$GITHUB_WORKSPACE/openssl-android"
+          mkdir -p "$WORK" "$BASE"
+
+          cd "$WORK"
+          curl --fail --location --retry 3 \
+            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
+            -o "openssl-${OPENSSL_VERSION}.tar.gz"
+          tar xzf "openssl-${OPENSSL_VERSION}.tar.gz"
+
+          cd "openssl-${OPENSSL_VERSION}"
+
+          for spec in \
+            "arm64:android-arm64:aarch64-linux-android21-clang" \
+            "arm:android-arm:armv7a-linux-androideabi19-clang"; do
+            IFS=: read -r dir target compiler <<< "$spec"
+            prefix="$BASE/openssl-${dir}"
+
+            make clean >/dev/null 2>&1 || true
+            PATH="$TOOLCHAIN:$PATH" ./Configure "$target" \
+              "CC=$TOOLCHAIN/$compiler" \
+              AR="$TOOLCHAIN/llvm-ar" \
+              RANLIB="$TOOLCHAIN/llvm-ranlib" \
+              no-shared no-tests no-asm \
+              --prefix="$prefix" --libdir=lib
+
+            make -j"$(nproc)"
+            make install_sw
+          done
+
+      - name: Build APK
+        working-directory: android
+        env:
+          OPENSSL_BASE_DIR: ${{ github.workspace }}/openssl-android
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AllPlay-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
